@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-#!/usr/bin/env python3
 """
 Predict where a balloon will drift over the next several hours, given a
 starting latitude, longitude, and altitude, using GFS wind forecasts
@@ -22,6 +21,16 @@ trajectory model"):
 Caveats (read before trusting this for anything real):
   - This ignores vertical motion's effect on wind shear unless you set
     a nonzero ascent/descent rate.
+  - Altitude-to-pressure conversion uses the piecewise US Standard
+    Atmosphere 1976 model, valid from the surface up to ~47 km -- so
+    stratospheric balloons (e.g. up to 40 km) are covered, but the
+    model clamps anything above 47 km rather than extrapolating.
+  - GFS's 0.25-degree pressure-level output only goes up to 1 hPa
+    (~48 km); at the highest levels (low single-digit hPa) there are
+    fewer vertical levels, so pressure-level snapping gets coarser the
+    higher you go. Stratospheric winds (e.g. the QBO, polar vortex) are
+    also structurally different from tropospheric winds and GFS may not
+    resolve fine-scale features as well up there.
   - Real balloon trajectories are also very sensitive to super-pressure
     balloon float dynamics, small-scale turbulence, and model error --
     GFS is a global ~25 km model and will smooth out local wind features
@@ -52,20 +61,53 @@ EARTH_RADIUS_M = 6_371_000.0
 
 def pressure_from_altitude_m(alt_m: float) -> float:
     """
-    Approximate pressure (hPa) from geometric altitude (m) using the
-    ICAO standard atmosphere (valid roughly 0-11 km, i.e. within the
-    troposphere -- fine for weather balloons in ascent, not for the
-    stratosphere).
+    Pressure (hPa) from geometric altitude (m) using the piecewise
+    US Standard Atmosphere 1976 model, valid from the surface up through
+    ~47 km -- i.e. covers the troposphere, tropopause, and stratosphere,
+    which is what you need for anything above ~11 km (where a simple
+    single-layer formula stops being a good approximation).
+
+    Layers (base altitude m, base temp K, base pressure Pa, lapse rate K/m):
+      0-11000 m:    troposphere,        L = -0.0065
+      11000-20000:  tropopause,         L =  0.0      (isothermal)
+      20000-32000:  stratosphere,       L = +0.001
+      32000-47000:  stratosphere,       L = +0.0028
     """
-    return 1013.25 * (1 - 2.25577e-5 * alt_m) ** 5.25588
+    g0 = 9.80665       # m/s^2
+    M = 0.0289644      # kg/mol, molar mass of air
+    R = 8.3144598      # J/(mol*K)
+
+    layers = [
+        # (base_alt_m, base_temp_K, base_pressure_Pa, lapse_rate_K_per_m)
+        (0.0,     288.15, 101325.0,   -0.0065),
+        (11000.0, 216.65,  22632.06,   0.0),
+        (20000.0, 216.65,   5474.89,   0.001),
+        (32000.0, 228.65,    868.02,   0.0028),
+        (47000.0, 270.65,    110.91,   0.0),  # ceiling of validity
+    ]
+
+    # Find which layer alt_m falls in (clamp to the table's range)
+    alt_m = max(0.0, min(alt_m, 47000.0))
+    for i in range(len(layers) - 1):
+        base_alt, base_T, base_P, L = layers[i]
+        next_alt = layers[i + 1][0]
+        if alt_m <= next_alt or i == len(layers) - 2:
+            dh = alt_m - base_alt
+            if L == 0.0:
+                pressure_pa = base_P * math.exp(-g0 * M * dh / (R * base_T))
+            else:
+                pressure_pa = base_P * (base_T / (base_T + L * dh)) ** (g0 * M / (R * L))
+            return pressure_pa / 100.0  # Pa -> hPa
+
+    raise ValueError(f"Altitude {alt_m} m is out of range for this model.")
 
 
 def nearest_gfs_pressure_level(pressure_hpa: float) -> int:
     """Snap to the nearest GFS isobaric level available in pgrb2.0p25."""
     levels = [
-        1000, 975, 950, 925, 900, 875, 850, 825, 800, 775, 750, 725, 700,
-        675, 650, 625, 600, 575, 550, 525, 500, 475, 450, 425, 400, 350,
-        300, 250, 200, 150, 100, 70, 50, 30, 20, 10,
+        1000, 975, 950, 925, 900, 850, 800, 750, 700, 650, 600, 550, 500,
+        450, 400, 350, 300, 250, 200, 150, 100, 70, 50, 40, 30, 20, 15,
+        10, 7, 5, 3, 2, 1,
     ]
     return min(levels, key=lambda lv: abs(lv - pressure_hpa))
 
@@ -88,6 +130,31 @@ def latest_available_gfs_run(now: datetime | None = None) -> datetime:
     return now.replace(hour=run_hour, minute=0, second=0, microsecond=0)
 
 
+def _xarray_with_retry(H: Herbie, search: str, tries: int = 3):
+    """
+    Call H.xarray(search) with retries. Herbie's subset downloads can
+    occasionally fail silently (transient network issue, or a stale/partial
+    file left behind from an earlier interrupted run) and leave no file at
+    the expected local path, which surfaces as a FileNotFoundError deep
+    inside cfgrib. Forcing overwrite=True on retry makes Herbie re-fetch
+    from scratch instead of trusting whatever (or nothing) is on disk.
+    """
+    last_err = None
+    for attempt in range(1, tries + 1):
+        try:
+            overwrite = attempt > 1  # first try: trust cache; then force fresh download
+            return H.xarray(search, remove_grib=False, overwrite=overwrite)
+        except FileNotFoundError as e:
+            last_err = e
+            print(f"  (attempt {attempt}/{tries}) subset download missing, retrying: {e}")
+    raise RuntimeError(
+        f"Failed to fetch '{search}' for {H.model} {H.date} f{H.fxx:03d} "
+        f"after {tries} attempts. This is usually a transient issue with "
+        f"NOMADS/AWS or Herbie's subset cache -- try again in a bit, or "
+        f"check H.inventory() to confirm this field exists for this run."
+    ) from last_err
+
+
 def get_uv_at_point(run_time: datetime, fxx: int, level_hpa: int,
                      lat: float, lon_0_360: float) -> tuple[float, float]:
     """
@@ -103,7 +170,7 @@ def get_uv_at_point(run_time: datetime, fxx: int, level_hpa: int,
     )
 
     search = f":[UV]GRD:{level_hpa} mb:"
-    ds = H.xarray(search, remove_grib=True)
+    ds = _xarray_with_retry(H, search)
 
     if isinstance(ds, list):
         if len(ds) == 0:
@@ -200,7 +267,7 @@ def get_cloud_cover(run_time: datetime, fxx: int):
         fxx=fxx,
         verbose=False,
     )
-    ds = H.xarray(":TCDC:entire atmosphere:", remove_grib=True)
+    ds = _xarray_with_retry(H, ":TCDC:entire atmosphere:")
 
     # If the search string matches more than one GRIB message (e.g. GFS
     # sometimes has both an instantaneous and a time-averaged TCDC record
