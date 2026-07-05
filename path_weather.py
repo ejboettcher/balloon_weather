@@ -240,4 +240,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main() # If I have the start and end points
